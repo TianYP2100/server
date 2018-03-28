@@ -119,12 +119,14 @@ static const Alter_inplace_info::HA_ALTER_FLAGS INNOBASE_ALTER_NOREBUILD
 #ifdef MYSQL_RENAME_INDEX
 	| Alter_inplace_info::RENAME_INDEX
 #endif
-	| Alter_inplace_info::ALTER_COLUMN_NAME
 	| Alter_inplace_info::ALTER_COLUMN_EQUAL_PACK_LENGTH
 	//| Alter_inplace_info::ALTER_INDEX_COMMENT
-	| Alter_inplace_info::ADD_VIRTUAL_COLUMN
-	| Alter_inplace_info::DROP_VIRTUAL_COLUMN
-	| Alter_inplace_info::ALTER_VIRTUAL_COLUMN_ORDER;
+	| Alter_inplace_info::DROP_VIRTUAL_COLUMN;
+
+static const Alter_inplace_info::HA_ALTER_FLAGS INNOBASE_ALTER_INSTANT
+	= Alter_inplace_info::ALTER_VIRTUAL_COLUMN_ORDER
+	| Alter_inplace_info::ALTER_COLUMN_NAME
+	| Alter_inplace_info::ADD_VIRTUAL_COLUMN;
 
 struct ha_innobase_inplace_ctx : public inplace_alter_handler_ctx
 {
@@ -517,7 +519,8 @@ innobase_need_rebuild(
 	const Alter_inplace_info*	ha_alter_info,
 	const TABLE*			table)
 {
-	if ((ha_alter_info->handler_flags & ~INNOBASE_INPLACE_IGNORE)
+	if ((ha_alter_info->handler_flags & ~(INNOBASE_INPLACE_IGNORE
+					      | INNOBASE_ALTER_INSTANT))
 	    == Alter_inplace_info::CHANGE_CREATE_OPTION) {
 		return create_option_need_rebuild(ha_alter_info, table);
 	}
@@ -679,13 +682,20 @@ instant_alter_column_possible(
 by ALTER TABLE and holding data used during in-place alter.
 
 @retval HA_ALTER_INPLACE_NOT_SUPPORTED Not supported
-@retval HA_ALTER_INPLACE_NO_LOCK Supported
-@retval HA_ALTER_INPLACE_SHARED_LOCK_AFTER_PREPARE Supported, but requires
-lock during main phase and exclusive lock during prepare phase.
-@retval HA_ALTER_INPLACE_NO_LOCK_AFTER_PREPARE Supported, prepare phase
-requires exclusive lock (any transactions that have accessed the table
-must commit or roll back first, and no transactions can access the table
-while prepare_inplace_alter_table() is executing)
+@retval HA_ALTER_INPLACE_INSTANT Supported
+@retval HA_ALTER_INPLACE_COPY_NO_LOCK Supported, It does table rebuild and
+prepare phase exclusive lock (any transactions that have accessed the
+table must commit or rollback first, and no transactions can access the
+table while prepare_inplace_alter_table() is executing
+@retval HA_ALTER_INPLACE_NOCOPY_NO_LOCK Supported, It refuse to do table
+rebuild and prepare phase exclusive lock (any transactions that have
+accessed the table must commit or roll back first, and no transactions
+can access the table while prepare_inplace_alter_table() is executing
+@retval HA_ALTER_INPLACE_COPY_LOCK Supported, It does table rebuild but
+requires lock during main phase and exclusive lock during prepare phase
+@retval HA_ALTER_INPLACE_NOCOPY_LOCK Supported, It refuse to do table
+rebuild but requires lock during main phase and exclusive lock during
+prepare phase.
 */
 
 enum_alter_inplace_result
@@ -696,7 +706,8 @@ ha_innobase::check_if_supported_inplace_alter(
 {
 	DBUG_ENTER("check_if_supported_inplace_alter");
 
-	if ((table->versioned(VERS_TIMESTAMP) || altered_table->versioned(VERS_TIMESTAMP))
+	if ((table->versioned(VERS_TIMESTAMP)
+	     || altered_table->versioned(VERS_TIMESTAMP))
 	    && innobase_need_rebuild(ha_alter_info, table)) {
 		ha_alter_info->unsupported_reason =
 			"Not implemented for system-versioned tables";
@@ -713,8 +724,9 @@ ha_innobase::check_if_supported_inplace_alter(
 	if (high_level_read_only
 	    || srv_sys_space.created_new_raw()
 	    || srv_force_recovery) {
-		ha_alter_info->unsupported_reason = (srv_force_recovery)?
-			"Operation not allowed when innodb_forced_recovery > 0." :
+		ha_alter_info->unsupported_reason =
+			srv_force_recovery ? "Operation not allowed when "
+					     "innodb_forced_recovery > 0." :
 			innobase_get_err_msg(ER_READ_ONLY_MODE);
 
 		DBUG_RETURN(HA_ALTER_INPLACE_NOT_SUPPORTED);
@@ -732,16 +744,18 @@ ha_innobase::check_if_supported_inplace_alter(
 
 	update_thd();
 
-	if (ha_alter_info->handler_flags
-	    & ~(INNOBASE_INPLACE_IGNORE
-		| INNOBASE_ALTER_NOREBUILD
-		| INNOBASE_ALTER_REBUILD)) {
+	if (ha_alter_info->handler_flags & ~(INNOBASE_INPLACE_IGNORE
+					     | INNOBASE_ALTER_NOREBUILD
+					     | INNOBASE_ALTER_REBUILD
+					     | INNOBASE_ALTER_INSTANT)) {
 
 		if (ha_alter_info->handler_flags
 		    & Alter_inplace_info::ALTER_STORED_COLUMN_TYPE) {
-			ha_alter_info->unsupported_reason = innobase_get_err_msg(
+			ha_alter_info->unsupported_reason =
+				innobase_get_err_msg(
 				ER_ALTER_OPERATION_NOT_SUPPORTED_REASON_COLUMN_TYPE);
 		}
+
 		DBUG_RETURN(HA_ALTER_INPLACE_NOT_SUPPORTED);
 	}
 
@@ -820,8 +834,9 @@ ha_innobase::check_if_supported_inplace_alter(
 	*/
 	for (ulint i = 0, icol= 0; i < table->s->fields; i++) {
 		const Field*		field = table->field[i];
-		const dict_col_t*	col = dict_table_get_nth_col(m_prebuilt->table, icol);
-		ulint		unsigned_flag;
+		const dict_col_t*	col = dict_table_get_nth_col(
+			m_prebuilt->table, icol);
+		ulint			unsigned_flag;
 
 		if (!field->stored_in_db()) {
 			continue;
@@ -829,7 +844,8 @@ ha_innobase::check_if_supported_inplace_alter(
 
 		icol++;
 
-		if (col->mtype != get_innobase_type_from_mysql_type(&unsigned_flag, field)) {
+		if (col->mtype != get_innobase_type_from_mysql_type(
+				&unsigned_flag, field)) {
 
 			DBUG_RETURN(HA_ALTER_INPLACE_NOT_SUPPORTED);
 		}
@@ -919,7 +935,8 @@ ha_innobase::check_if_supported_inplace_alter(
 		}
 
 		for (KEY_PART_INFO* key_part = new_key->key_part;
-		     key_part < new_key->key_part + new_key->user_defined_key_parts;
+		     key_part < (new_key->key_part
+				 + new_key->user_defined_key_parts);
 		     key_part++) {
 			const Create_field*	new_field;
 
@@ -963,7 +980,8 @@ ha_innobase::check_if_supported_inplace_alter(
 				    system_charset_info,
 				    key_part->field->field_name.str,
 				    FTS_DOC_ID_COL_NAME)) {
-				ha_alter_info->unsupported_reason = innobase_get_err_msg(
+				ha_alter_info->unsupported_reason =
+					innobase_get_err_msg(
 					ER_ALTER_OPERATION_NOT_SUPPORTED_REASON_HIDDEN_FTS);
 				DBUG_RETURN(HA_ALTER_INPLACE_NOT_SUPPORTED);
 			}
@@ -978,7 +996,8 @@ ha_innobase::check_if_supported_inplace_alter(
 				column values during online ALTER. */
 				DBUG_ASSERT(key_part->field == altered_table
 					    -> found_next_number_field);
-				ha_alter_info->unsupported_reason = innobase_get_err_msg(
+				ha_alter_info->unsupported_reason =
+					innobase_get_err_msg(
 					ER_ALTER_OPERATION_NOT_SUPPORTED_REASON_AUTOINC);
 				online = false;
 			}
@@ -1002,13 +1021,14 @@ ha_innobase::check_if_supported_inplace_alter(
 		}
 	}
 
-	DBUG_ASSERT(!m_prebuilt->table->fts || m_prebuilt->table->fts->doc_col
-		    <= table->s->fields);
-	DBUG_ASSERT(!m_prebuilt->table->fts || m_prebuilt->table->fts->doc_col
-		    < dict_table_get_n_user_cols(m_prebuilt->table));
+	DBUG_ASSERT(!m_prebuilt->table->fts
+		    || (m_prebuilt->table->fts->doc_col <= table->s->fields));
 
-	if (m_prebuilt->table->fts
-	    && innobase_fulltext_exist(altered_table)) {
+	DBUG_ASSERT(!m_prebuilt->table->fts
+		    || (m_prebuilt->table->fts->doc_col
+		        < dict_table_get_n_user_cols(m_prebuilt->table)));
+
+	if (m_prebuilt->table->fts && innobase_fulltext_exist(altered_table)) {
 		/* FULLTEXT indexes are supposed to remain. */
 		/* Disallow DROP INDEX FTS_DOC_ID_INDEX */
 
@@ -1017,7 +1037,8 @@ ha_innobase::check_if_supported_inplace_alter(
 				    system_charset_info,
 				    ha_alter_info->index_drop_buffer[i]->name.str,
 				    FTS_DOC_ID_INDEX_NAME)) {
-				ha_alter_info->unsupported_reason = innobase_get_err_msg(
+				ha_alter_info->unsupported_reason =
+					innobase_get_err_msg(
 					ER_ALTER_OPERATION_NOT_SUPPORTED_REASON_CHANGE_FTS);
 				DBUG_RETURN(HA_ALTER_INPLACE_NOT_SUPPORTED);
 			}
@@ -1037,7 +1058,8 @@ ha_innobase::check_if_supported_inplace_alter(
 				    system_charset_info,
 				    (*fp)->field_name.str,
 				    FTS_DOC_ID_COL_NAME)) {
-				ha_alter_info->unsupported_reason = innobase_get_err_msg(
+				ha_alter_info->unsupported_reason =
+					innobase_get_err_msg(
 					ER_ALTER_OPERATION_NOT_SUPPORTED_REASON_CHANGE_FTS);
 				DBUG_RETURN(HA_ALTER_INPLACE_NOT_SUPPORTED);
 			}
@@ -1159,7 +1181,12 @@ next_column:
 		/* MDEV-14246 FIXME: return HA_ALTER_INPLACE_NO_LOCK and
 		perform all work in ha_innobase::commit_inplace_alter_table(),
 		to avoid an unnecessary MDL upgrade/downgrade cycle. */
-		DBUG_RETURN(HA_ALTER_INPLACE_NO_LOCK_AFTER_PREPARE);
+		DBUG_RETURN(HA_ALTER_INPLACE_INSTANT);
+	}
+
+	if (!(ha_alter_info->handler_flags & ~(INNOBASE_ALTER_INSTANT
+					       | INNOBASE_INPLACE_IGNORE))) {
+		DBUG_RETURN(HA_ALTER_INPLACE_INSTANT);
 	}
 
 	if (!online) {
@@ -1178,8 +1205,8 @@ next_column:
 		refuse to rebuild the table natively altogether. */
 		if (m_prebuilt->table->fts) {
 cannot_create_many_fulltext_index:
-			ha_alter_info->unsupported_reason = innobase_get_err_msg(
-				ER_INNODB_FT_LIMIT);
+			ha_alter_info->unsupported_reason =
+				innobase_get_err_msg(ER_INNODB_FT_LIMIT);
 			DBUG_RETURN(HA_ALTER_INPLACE_NOT_SUPPORTED);
 		}
 
@@ -1223,12 +1250,15 @@ cannot_create_many_fulltext_index:
 					goto cannot_create_many_fulltext_index;
 				}
 				add_fulltext = true;
-				ha_alter_info->unsupported_reason = innobase_get_err_msg(
+				ha_alter_info->unsupported_reason =
+					innobase_get_err_msg(
 					ER_ALTER_OPERATION_NOT_SUPPORTED_REASON_FTS);
 				online = false;
 			}
+
 			if (online && (key->flags & HA_SPATIAL)) {
-				ha_alter_info->unsupported_reason = innobase_get_err_msg(
+				ha_alter_info->unsupported_reason =
+					innobase_get_err_msg(
 					ER_ALTER_OPERATION_NOT_SUPPORTED_REASON_GIS);
 				online = false;
 			}
@@ -1236,16 +1266,24 @@ cannot_create_many_fulltext_index:
 	}
 
 	// FIXME: implement Online DDL for system-versioned tables
-	if ((table->versioned(VERS_TRX_ID) || altered_table->versioned(VERS_TRX_ID))
+	if ((table->versioned(VERS_TRX_ID)
+	     || altered_table->versioned(VERS_TRX_ID))
 	    && innobase_need_rebuild(ha_alter_info, table)) {
 		ha_alter_info->unsupported_reason =
 			"Not implemented for system-versioned tables";
 		online = false;
 	}
 
+	if (innobase_need_rebuild(ha_alter_info, table)) {
+
+		DBUG_RETURN(online
+			    ? HA_ALTER_INPLACE_COPY_NO_LOCK
+			    : HA_ALTER_INPLACE_COPY_LOCK);
+	}
+	
 	DBUG_RETURN(online
-		    ? HA_ALTER_INPLACE_NO_LOCK_AFTER_PREPARE
-		    : HA_ALTER_INPLACE_SHARED_LOCK_AFTER_PREPARE);
+		    ? HA_ALTER_INPLACE_NOCOPY_NO_LOCK
+		    : HA_ALTER_INPLACE_NOCOPY_LOCK);
 }
 
 /*************************************************************//**
@@ -6164,7 +6202,7 @@ ha_innobase::prepare_inplace_alter_table(
 		     m_prebuilt->table, CHECK_ABORTED_OK));
 	ut_d(mutex_exit(&dict_sys->mutex));
 
-	if (!(ha_alter_info->handler_flags & ~INNOBASE_INPLACE_IGNORE)) {
+	if (!(ha_alter_info->handler_flags & ~(INNOBASE_INPLACE_IGNORE))) {
 		/* Nothing to do */
 		DBUG_ASSERT(m_prebuilt->trx->dict_operation_lock_mode == 0);
 		if (ha_alter_info->handler_flags & ~INNOBASE_INPLACE_IGNORE) {
@@ -6255,7 +6293,7 @@ ha_innobase::prepare_inplace_alter_table(
 		    ha_alter_info->key_count)) {
 err_exit_no_heap:
 		DBUG_ASSERT(m_prebuilt->trx->dict_operation_lock_mode == 0);
-		if (ha_alter_info->handler_flags & ~INNOBASE_INPLACE_IGNORE) {
+		if (ha_alter_info->handler_flags & ~(INNOBASE_INPLACE_IGNORE)) {
 
 			online_retry_drop_indexes(
 				m_prebuilt->table, m_user_thd);
@@ -6415,7 +6453,8 @@ check_if_ok_to_rename:
 	n_drop_fk = 0;
 
 	if (ha_alter_info->handler_flags
-	    & (INNOBASE_ALTER_NOREBUILD | INNOBASE_ALTER_REBUILD)) {
+	    & (INNOBASE_ALTER_NOREBUILD | INNOBASE_ALTER_REBUILD
+	       | INNOBASE_ALTER_INSTANT)) {
 		heap = mem_heap_create(1024);
 
 		if (ha_alter_info->handler_flags
@@ -6716,7 +6755,8 @@ err_exit:
 	}
 
 	if (!(ha_alter_info->handler_flags & INNOBASE_ALTER_DATA)
-	    || ((ha_alter_info->handler_flags & ~INNOBASE_INPLACE_IGNORE)
+	    || ((ha_alter_info->handler_flags & ~(INNOBASE_INPLACE_IGNORE
+						  | INNOBASE_ALTER_INSTANT))
 		== Alter_inplace_info::CHANGE_CREATE_OPTION
 		&& !create_option_need_rebuild(ha_alter_info, table))) {
 
@@ -6734,7 +6774,7 @@ err_exit:
 		}
 
 		DBUG_ASSERT(m_prebuilt->trx->dict_operation_lock_mode == 0);
-		if (ha_alter_info->handler_flags & ~INNOBASE_INPLACE_IGNORE) {
+		if (ha_alter_info->handler_flags & ~(INNOBASE_INPLACE_IGNORE)) {
 
 			online_retry_drop_indexes(
 				m_prebuilt->table, m_user_thd);
@@ -7001,7 +7041,8 @@ ok_exit:
 		DBUG_RETURN(false);
 	}
 
-	if ((ha_alter_info->handler_flags & ~INNOBASE_INPLACE_IGNORE)
+	if ((ha_alter_info->handler_flags & ~(INNOBASE_INPLACE_IGNORE
+					      | INNOBASE_ALTER_INSTANT))
 	    == Alter_inplace_info::CHANGE_CREATE_OPTION
 	    && !create_option_need_rebuild(ha_alter_info, table)) {
 		goto ok_exit;
@@ -9066,7 +9107,7 @@ ha_innobase::commit_inplace_alter_table(
 		DBUG_RETURN(ret);
 	}
 
-	if (!(ha_alter_info->handler_flags & ~INNOBASE_INPLACE_IGNORE)) {
+	if (!(ha_alter_info->handler_flags & ~(INNOBASE_INPLACE_IGNORE))) {
 		DBUG_ASSERT(!ctx0);
 		MONITOR_ATOMIC_DEC(MONITOR_PENDING_ALTER_TABLE);
 		ha_alter_info->group_commit_ctx = NULL;
